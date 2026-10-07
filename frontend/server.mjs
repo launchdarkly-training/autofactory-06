@@ -16,9 +16,13 @@ const SHA = process.env.RAILWAY_GIT_COMMIT_SHA || "dev";
 const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:8000";
 
 export const BACKEND_STATUS_FLAG = "enable-backend-status";
+export const BACKEND_STATUS_BEACON_PATH = "/api/telemetry/backend-status";
 
 /** Matches the backend's context convention (backend/app.py `_ld_context`). */
 const LD_CONTEXT = { kind: "user", key: "demo-user" };
+
+/** An implausible render duration is a bug or a clock skew, not a measurement. */
+const MAX_PLAUSIBLE_RENDER_MS = 60_000;
 
 /**
  * Resolve the flag to a variation value. Never throws: an unreachable or
@@ -34,6 +38,16 @@ async function backendStatusVariation(ldClient) {
   }
 }
 
+/** Telemetry must never be able to fail a request. */
+function emit(ldClient, eventKey, metricValue) {
+  if (!ldClient) return;
+  try {
+    ldClient.track(eventKey, LD_CONTEXT, undefined, metricValue);
+  } catch {
+    /* swallowed on purpose */
+  }
+}
+
 const BACKEND_STATUS_PARAGRAPH = `
   <p id="backend-status">Checking backend status…</p>`;
 
@@ -41,8 +55,10 @@ const BACKEND_STATUS_SCRIPT = `
     fetch("${BACKEND_URL}/api/status")
       .then(r => r.json())
       .then(d => { document.getElementById("backend-status").textContent =
-        "Backend online: " + d.service + " version " + d.version; })
-      .catch(() => { document.getElementById("backend-status").textContent = "Backend offline"; });`;
+        "Backend online: " + d.service + " version " + d.version;
+        navigator.sendBeacon("${BACKEND_STATUS_BEACON_PATH}", JSON.stringify({ outcome: "ok" })); })
+      .catch(() => { document.getElementById("backend-status").textContent = "Backend offline";
+        navigator.sendBeacon("${BACKEND_STATUS_BEACON_PATH}", JSON.stringify({ outcome: "error" })); });`;
 
 function renderPage({ showBackendStatus }) {
   const paragraph = showBackendStatus ? BACKEND_STATUS_PARAGRAPH : "";
@@ -71,9 +87,40 @@ export function createApp({ ldClient = null } = {}) {
   });
 
   app.get("/", async (_req, res) => {
+    const startedAt = Date.now();
     const variation = await backendStatusVariation(ldClient);
     res.type("html").send(renderPage({ showBackendStatus: variation === "v1" }));
+
+    // Emitted on BOTH variations so the guarded release has a real comparison.
+    const elapsedMs = Date.now() - startedAt;
+    if (elapsedMs >= 0 && elapsedMs <= MAX_PLAUSIBLE_RENDER_MS) {
+      emit(ldClient, "enable-backend-status-latency", elapsedMs);
+    }
   });
+
+  // navigator.sendBeacon posts a Blob with an arbitrary content type, so take
+  // the body as text and parse it here rather than letting express.json 400.
+  app.post(
+    BACKEND_STATUS_BEACON_PATH,
+    express.text({ type: "*/*", limit: "1kb" }),
+    (req, res) => {
+      res.status(204).end();
+
+      let body;
+      try {
+        body = JSON.parse(req.body);
+      } catch {
+        return;
+      }
+      if (!body || typeof body !== "object") return;
+
+      if (body.outcome === "ok") {
+        emit(ldClient, "enable-backend-status-success");
+      } else if (body.outcome === "error") {
+        emit(ldClient, "enable-backend-status-error");
+      }
+    },
+  );
 
   return app;
 }
